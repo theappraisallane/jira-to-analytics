@@ -2,25 +2,6 @@ import * as moment from 'moment';
 import 'moment-business-days';
 import { JiraApiBaseItem, JiraApiIssue, JiraComputedItem, StagePassedDays, Workflow } from '../types';
 
-const addCreatedToFirstStage = (issue: JiraApiIssue, stageBins: string[][]) => {
-  const creationDate: string = issue.fields['created'];
-  stageBins[0].push(creationDate);
-  return stageBins;
-};
-
-const addResolutionDateToClosedStage = (issue: JiraApiIssue, stageMap, stageBins) => {
-  if (issue.fields['status'] !== undefined || issue.fields['status'] != null) {
-    if (issue.fields['status'].name === 'Closed') {
-      if (issue.fields['resolutiondate'] !== undefined || issue.fields['resolutiondate'] != null) {
-        const resolutionDate: string = issue.fields['resolutiondate'];
-        const doneStageIndex: number = stageMap.get('Closed');
-        stageBins[doneStageIndex].push(resolutionDate);
-      }
-    }
-  }
-  return stageBins;
-};
-
 const processHistories = (issue: JiraApiIssue): [JiraComputedItem] => {
   const sortedItems: [JiraComputedItem] = [].concat.apply([], issue.changelog.histories
     .map(history => [
@@ -80,39 +61,32 @@ const processInactiveStates = (stages: string[], activeStatuses: string[], sorte
     });
 };
 
-const getStagingDates = (issue: JiraApiIssue, workflow: Workflow, activeStatuses: Array<string>): string[] => {
-  const createInFirstStage = workflow[Object.keys(workflow)[0]].includes('(Created)');
-  const resolvedInLastStage = workflow[Object.keys(workflow)[Object.keys(workflow).length - 1]].includes('(Resolved)');
+const mapDoneIssue = (stages: string[], activeStatuses: string[], activeStatusesPassedDays: Map<string, StagePassedDays>, inactiveStatusesDates: Map<string, moment.Moment>) => {
+  const activeStatusesReversed = [...activeStatuses].reverse();
+  let activeStatusDate: moment.Moment = inactiveStatusesDates['Done'];
+  const activeStatusDates = new Map<string, moment.Moment>();
+  activeStatusesReversed.forEach(status => {
+    let passedDaysResult: StagePassedDays = activeStatusesPassedDays[status];
+    if (!passedDaysResult.didHappen) {
+      return;
+    }
+    /* NOTE: as opposed to "subtract", "businessSubtract" doesn't mutate state, so the next lines are safe to be executed like this */
+    // subtract (business) days from the next status
+    activeStatusDate = activeStatusDate.businessSubtract(passedDaysResult.passedDays);
+    activeStatusDates[status] = activeStatusDate;
+  });
+  return stages.map(stage => {
+    let date;
+    if (activeStatuses.includes(stage)) {
+      date = activeStatusDates[stage];
+    } else {
+      date = inactiveStatusesDates[stage];
+    }
+    return (date && date.format('YYYY-MM-DD')) || '';
+  });
+};
 
-  const stages = Object.keys(workflow);
-  const stageMap = stages.reduce((map: Map<string, number>, stage: string, i: number) => {
-    return workflow[stage].reduce((map: Map<string, number>, stageAlias: string) => {
-      return map.set(stageAlias, i);
-    }, map);
-  }, new Map<string, number>());
-
-  let stageBins: string[][] = stages.map(() => []); // todo, we dont need stages variable....just create array;
-
-  if (createInFirstStage) {
-    stageBins = addCreatedToFirstStage(issue, stageBins);
-  }
-  if (resolvedInLastStage) {
-    stageBins = addResolutionDateToClosedStage(issue, stageMap, stageBins);
-  }
-
-  const sortedItems: [JiraComputedItem] = processHistories(issue);
-
-  // at this point, we have an array of `JiraComputedItem` with both `previousCreated` and `created` properties, which
-  // reflects the time range the `fromString` status happened
-  const inactiveStatusesDates = new Map<string, moment.Moment>();
-  const activeStatusesPassedDays = new Map<string, StagePassedDays>();
-
-  // calculate how many business days this issue was in for each active status
-  let activeStatusDate: moment.Moment = processActiveStatuses(issue, stages, activeStatuses, sortedItems, activeStatusesPassedDays);
-
-  // get each inactive state start date
-  processInactiveStates(stages, activeStatuses, sortedItems, inactiveStatusesDates);
-
+const mapNotDoneIssue = (stages: string[], activeStatuses: string[], activeStatusesPassedDays: Map<string, StagePassedDays>, inactiveStatusesDates: Map<string, moment.Moment>, activeStatusDate: moment.Moment) => {
   return stages.map(stage => {
     const isDone = stage.toLowerCase() === 'done';
     if (!activeStatuses.includes(stage) && !isDone) {
@@ -130,10 +104,35 @@ const getStagingDates = (issue: JiraApiIssue, workflow: Workflow, activeStatuses
     /* NOTE: as opposed to "add", "businessAdd" doesn't mutate state, so the next lines are safe to be executed like this */
     // save for return for this status
     const stageDate = activeStatusDate;
-    // add passed days for next status (business
+    // add passed (business) days for next status
     activeStatusDate = activeStatusDate.businessAdd(passedDaysResult.passedDays);
     return stageDate.format('YYYY-MM-DD');
   });
+};
+
+const getStagingDates = (issue: JiraApiIssue, workflow: Workflow, activeStatuses: Array<string>): string[] => {
+  const stages = Object.keys(workflow);
+
+  const sortedItems: [JiraComputedItem] = processHistories(issue);
+
+  // at this point, we have an array of `JiraComputedItem` with both `previousCreated` and `created` properties, which
+  // reflects the time range the `fromString` status happened
+  const inactiveStatusesDates = new Map<string, moment.Moment>();
+  const activeStatusesPassedDays = new Map<string, StagePassedDays>();
+
+  // calculate how many business days this issue was in for each active status
+  let activeStatusDate: moment.Moment = processActiveStatuses(issue, stages, activeStatuses, sortedItems, activeStatusesPassedDays);
+
+  // get each inactive state start date
+  processInactiveStates(stages, activeStatuses, sortedItems, inactiveStatusesDates);
+
+  const isDoneDate = inactiveStatusesDates['Done'];
+  if (!isDoneDate) {
+    // start from first active state and simulate from there
+    return mapNotDoneIssue(stages, activeStatuses, activeStatusesPassedDays, inactiveStatusesDates, activeStatusDate);
+  }
+  // start from the Done state and simulate back from there
+  return mapDoneIssue(stages, activeStatuses, activeStatusesPassedDays, inactiveStatusesDates);
 };
 
 export {
