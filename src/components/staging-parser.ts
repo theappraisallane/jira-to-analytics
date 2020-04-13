@@ -1,4 +1,5 @@
 import * as moment from 'moment';
+import 'moment-business-days';
 import { JiraApiBaseItem, JiraApiIssue, JiraComputedItem, StagePassedDays, Workflow } from '../types';
 
 const addCreatedToFirstStage = (issue: JiraApiIssue, stageBins: string[][]) => {
@@ -63,7 +64,7 @@ const processActiveStatuses = (issue: JiraApiIssue, stages: string[], activeStat
             activeStatusDate = statusStart;
           }
           // count the passed days for active statuses
-          return { didHappen: true, passedDays: passedDays + statusEnd.diff(statusStart, 'days') };
+          return { didHappen: true, passedDays: passedDays + statusEnd.businessDiff(statusStart) };
         }, <StagePassedDays>{ didHappen: false, passedDays: 0 });
     });
   return activeStatusDate;
@@ -106,10 +107,10 @@ const getStagingDates = (issue: JiraApiIssue, workflow: Workflow, activeStatuses
   const inactiveStatusesDates = new Map<string, moment.Moment>();
   const activeStatusesPassedDays = new Map<string, StagePassedDays>();
 
-  // process active statuses
+  // calculate how many business days this issue was in for each active status
   let activeStatusDate: moment.Moment = processActiveStatuses(issue, stages, activeStatuses, sortedItems, activeStatusesPassedDays);
 
-  // process inactive statuses
+  // get each inactive state start date
   processInactiveStates(stages, activeStatuses, sortedItems, inactiveStatusesDates);
 
   return stages.map(stage => {
@@ -121,15 +122,16 @@ const getStagingDates = (issue: JiraApiIssue, workflow: Workflow, activeStatuses
     // account for non done tasks
     if (isDone && !inactiveStatusesDates[stage]) { return ''; }
     if (isDone) {
-      // return previous active status date + its passed days
+      // return previous active status date (i.e. Product Review) + its passed days
       return activeStatusDate.format('YYYY-MM-DD');
     }
     const passedDaysResult: StagePassedDays = activeStatusesPassedDays[stage];
     if (!passedDaysResult.didHappen) { return ''; }
+    /* NOTE: as opposed to "add", "businessAdd" doesn't mutate state, so the next lines are safe to be executed like this */
     // save for return for this status
-    const stageDate = moment(activeStatusDate);
-    // add passed days for next status
-    activeStatusDate.add(passedDaysResult.passedDays, 'days');
+    const stageDate = activeStatusDate;
+    // add passed days for next status (business
+    activeStatusDate = activeStatusDate.businessAdd(passedDaysResult.passedDays);
     return stageDate.format('YYYY-MM-DD');
   });
 };
